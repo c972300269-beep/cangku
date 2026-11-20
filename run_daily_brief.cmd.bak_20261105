@@ -1,0 +1,56 @@
+@echo off
+setlocal DisableDelayedExpansion
+set "PYTHONIOENCODING=utf-8"
+set "PLAYWRIGHT_BROWSERS_PATH=C:/Users/chenjialin3/.workbuddy/binaries/playwright-browsers"
+set "NODE_PATH=C:/Users/chenjialin3/.workbuddy/binaries/node/workspace/node_modules"
+set "BPM_USER=chenjialin3"
+set "BPM_PASS=__REDACTED_SECRET__"
+set "OUTPUT_DIR=E:/workbuddy/Claw/.workbuddy"
+set "NODE=C:/Users/chenjialin3/.workbuddy/binaries/node/versions/22.22.2-6/node.exe"
+set "PY=C:/Users/chenjialin3/.workbuddy/binaries/python/versions/3.13.12/python.exe"
+set "BASE=E:/workbuddy/Claw/.workbuddy/scripts"
+set "LOG=E:/workbuddy/Claw/.workbuddy/brief_log.txt"
+set "BRIEF=E:/workbuddy/Claw/.workbuddy/bpm_brief.txt"
+
+echo %date% %time% === START === >> "%LOG%"
+
+set "FETCH_OK=0"
+for /l %%i in (1,1,3) do (
+  "%NODE%" "%BASE%/bpm_fetch_data.js" >> "%LOG%" 2>&1
+  if not errorlevel 1 (
+    set "FETCH_OK=1"
+    echo %date% %time% FETCH_OK try%%i >> "%LOG%"
+    goto :GEN
+  )
+  echo %date% %time% FETCH_FAIL try%%i >> "%LOG%"
+  timeout /t 15 /nobreak >nul
+)
+if "%FETCH_OK%" == "0" (
+  echo %date% %time% FETCH_GAVEUP >> "%LOG%"
+  echo %date% %time% === END === >> "%LOG%"
+  endlocal
+  exit /b 1
+)
+
+:GEN
+rem Incremental fetch of qingkuan amounts (only missing/new flows; best-effort, never blocks brief)
+"%NODE%" "%BASE%/bpm_fetch_amounts.js" >> "%LOG%" 2>&1
+echo %date% %time% AMOUNTS_DONE code=%errorlevel% >> "%LOG%"
+"%PY%" "%BASE%/gen_bpm_brief.py" > "%BRIEF%" 2>> "%LOG%"
+if errorlevel 1 (
+  echo %date% %time% GEN_FAIL >> "%LOG%"
+  echo %date% %time% === END === >> "%LOG%"
+  endlocal
+  exit /b 1
+) else (
+  echo %date% %time% GEN_OK >> "%LOG%"
+)
+
+"%PY%" "%BASE%/wb_checkin/notify_mail.py" AUTO "%BRIEF%" >> "%LOG%" 2>&1
+echo %date% %time% MAIL_DONE code=%errorlevel% >> "%LOG%"
+
+"%PY%" "%BASE%/wecom_push_brief.py" >> "%LOG%" 2>&1
+echo %date% %time% WECOM_DONE code=%errorlevel% >> "%LOG%"
+
+echo %date% %time% === END === >> "%LOG%"
+endlocal

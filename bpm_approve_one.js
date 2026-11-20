@@ -1,0 +1,175 @@
+const { chromium } = require('C:\\Users\\chenjialin3\\.workbuddy\\binaries\\node\\workspace\\node_modules\\playwright');
+const fs = require('fs');
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const SN = process.argv[2] || 'REQ20261056168';
+const KEY = process.argv[3] || '调班';
+
+function log(m) { console.log('[' + new Date().toTimeString().slice(0, 8) + '] ' + m); }
+
+// 在指定 frame 里找文字完全匹配的按钮，返回 {frame, rect}
+async function findBtn(page, text) {
+  const frames = page.frames();
+  for (const f of frames) {
+    try {
+      const hit = await f.evaluate((txt) => {
+        const cands = [...document.querySelectorAll('a.x-btn, button, span.x-btn-inner, a, input[type=button]')];
+        for (const el of cands) {
+          const t = (el.tagName === 'INPUT' ? el.value : el.innerText || '').trim();
+          if (t === txt) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height };
+            }
+          }
+        }
+        return null;
+      }, text);
+      if (hit) return { frame: f, ...hit };
+    } catch (e) {}
+  }
+  return null;
+}
+
+// 真实鼠标点击坐标（frame 偏移已含在 evaluate 的 getBoundingClientRect 坐标内，因为 iframe 坐标为相对视口——注意 frame 内坐标需加 iframe 偏移）
+async function mouseClickAt(page, btn) {
+  let x = btn.x, y = btn.y;
+  if (btn.frame !== page.mainFrame()) {
+    const off = await btn.frame.frameElement().then(fe => fe.boundingBox());
+    if (off) { x += off.x; y += off.y; }
+  }
+  await page.mouse.move(x, y, { steps: 5 });
+  await wait(150);
+  await page.mouse.down();
+  await wait(80);
+  await page.mouse.up();
+  return { x, y };
+}
+
+async function clickBtn(page, text, tries = 8) {
+  for (let i = 0; i < tries; i++) {
+    const btn = await findBtn(page, text);
+    if (btn) {
+      await mouseClickAt(page, btn);
+      log(`  「${text}」点击 @(${Math.round(btn.x)},${Math.round(btn.y)}) 第${i + 1}次`);
+      return true;
+    }
+    await wait(3000);
+  }
+  log(`  ✗ 找不到「${text}」`);
+  return false;
+}
+
+async function worklistHas(page, sn) {
+  return await page.evaluate(async (s) => {
+    const r = await fetch('/YZSoft.Services.REST/BPM/TaskList.ashx?method=GetWorkList&_dc=' + Date.now(), { credentials: 'include' });
+    return (await r.text()).includes(s);
+  }, sn);
+}
+
+(async () => {
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath: 'C:\\Users\\chenjialin3\\AppData\\Local\\ms-playwright\\chromium-1228\\chrome-win64\\chrome.exe',
+    args: ['--no-sandbox']
+  });
+  const page = await (await browser.newContext({ viewport: { width: 1920, height: 1080 }, ignoreHTTPSErrors: true })).newPage();
+  page.on('dialog', async d => { try { await d.accept(); } catch {} });
+
+  log('登录 BPM...');
+  await page.goto('http://bpm.timesgroup.cn', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await wait(14000);
+
+  const t = await page.evaluate(async (sn) => {
+    const r = await fetch('/YZSoft.Services.REST/BPM/TaskList.ashx?method=GetWorkList&_dc=' + Date.now(), { credentials: 'include' });
+    const j = JSON.parse((await r.text()).replace(/new Date\(([^)]+)\)/g, '"date"'));
+    const hit = (j.children || []).find(x => x.SerialNum === sn);
+    return hit ? { TaskID: hit.TaskID, StepID: hit.StepID, State: hit.State, Desc: hit.Description } : null;
+  }, SN);
+  log('命中: ' + JSON.stringify(t));
+  if (!t) { await browser.close(); return process.exit(1); }
+
+  await page.goto(`http://bpm.timesgroup.cn/YZSoft/Forms/Process.aspx?TaskID=${t.TaskID}&StepID=${t.StepID}&pid=${t.StepID}&state=${t.State}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+  // 等表单+工具栏就绪：以「同意」按钮出现为准
+  log('等待「同意」按钮出现...');
+  let ready = false;
+  for (let i = 0; i < 40; i++) {
+    if (await findBtn(page, '同意')) { ready = true; break; }
+    await wait(4000);
+  }
+  log('按钮就绪=' + ready);
+  if (!ready) { await page.screenshot({ path: 'E:\\workbuddy\\Claw\\reports\\bpm_probe\\one_fail.png' }); await browser.close(); return process.exit(2); }
+  await wait(5000); // 让遮罩/渲染彻底结束
+
+  // 点同意
+  if (!await clickBtn(page, '同意', 5)) { await browser.close(); return process.exit(3); }
+  await wait(4000);
+
+  // 审批意见面板：填意见（若可填）→ 点确定
+  // 已知偶发：点「同意」后确认面板不渲染 → 再点一次「同意」唤出面板（人工经验）
+  const commentFilled = await (async () => {
+    for (const f of page.frames()) {
+      try {
+        const ok = await f.evaluate(() => {
+          const ta = [...document.querySelectorAll('textarea, input[type=text]')].find(el => {
+            const r = el.getBoundingClientRect();
+            return r.width > 100 && r.height > 15 && /意见|comment/i.test((el.name || '') + (el.id || '') + (el.placeholder || ''));
+          }) || [...document.querySelectorAll('textarea')].find(el => el.getBoundingClientRect().width > 100);
+          if (ta) { ta.value = '同意'; ta.dispatchEvent(new Event('input', { bubbles: true })); return true; }
+          return false;
+        });
+        if (ok) { log('  意见已填（frame=' + f.url().slice(-30) + '）'); return true; }
+      } catch (e) {}
+    }
+    return false;
+  })();
+  log('  意见填写=' + commentFilled);
+  await wait(2000);
+
+  let confirmed = false;
+  for (let round = 1; round <= 3 && !confirmed; round++) {
+    if (round > 1) {
+      log(`  第${round}轮：再点一次「同意」唤出确认面板...`);
+      if (await findBtn(page, '同意')) { await clickBtn(page, '同意', 3); }
+      await wait(5000);
+      // 面板重新出现后意见框可能被重置，再补填一次
+      for (const f of page.frames()) {
+        try {
+          const ok = await f.evaluate(() => {
+            const ta = [...document.querySelectorAll('textarea')].find(el => el.getBoundingClientRect().width > 100);
+            if (ta && !ta.value) { ta.value = '同意'; ta.dispatchEvent(new Event('input', { bubbles: true })); return true; }
+            return false;
+          });
+          if (ok) { log('  意见补填=true'); break; }
+        } catch (e) {}
+      }
+      await wait(2000);
+    }
+    confirmed = await clickBtn(page, '确定', 6);
+  }
+  if (!confirmed) { await browser.close(); return process.exit(4); }
+
+  // 就地等待提交完成
+  log('等待提交完成...');
+  let submitted = false;
+  for (let i = 0; i < 40; i++) {
+    await wait(4000);
+    if (!(await worklistHas(page, SN))) { submitted = true; break; }
+  }
+  log('提交完成=' + submitted);
+  await page.screenshot({ path: 'E:\\workbuddy\\Claw\\reports\\bpm_probe\\one_done.png' });
+
+  // 终验
+  await page.goto('http://bpm.timesgroup.cn', { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await wait(8000);
+  const final = await page.evaluate(async () => {
+    const r = await fetch('/YZSoft.Services.REST/BPM/TaskList.ashx?method=GetWorkList&_dc=' + Date.now(), { credentials: 'include' });
+    const j = JSON.parse((await r.text()).replace(/new Date\(([^)]+)\)/g, '"date"'));
+    return (j.children || []).map(x => x.SerialNum + ' ' + x.Description);
+  });
+  log('最终待办 ' + final.length + ' 条: ' + final.join(' | '));
+  fs.writeFileSync('E:\\workbuddy\\Claw\\.workbuddy\\bpm_output\\approve_one_result.json',
+    JSON.stringify({ time: new Date().toISOString(), sn: SN, submitted, finalCount: final.length, final }, null, 2), 'utf8');
+  await browser.close();
+  process.exit(submitted ? 0 : 5);
+})().catch(e => { console.error('ERR', e.message); process.exit(9); });
